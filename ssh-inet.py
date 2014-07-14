@@ -380,7 +380,7 @@ if __name__ == "__main__":
         #print(os.environ["PS1"], "!")
         #ret = call_cmd("/bin/bash")
         #ret = call_cmd("mysql -u root")
-        ret = call_cmd("ssh 192.168.1.2 sudo bash")
+        ret = call_cmd("ssh localhost sudo bash")
         print("!", ret)
         
     if False:
