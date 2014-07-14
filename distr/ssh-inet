@@ -58,17 +58,6 @@ def make_tcp_server(handle_stream):
     # больших чтениях
     return Server(max_buffer_size=404857600)
 
-def start_tcp_server(handle_stream, port):
-    server = make_tcp_server(handle_stream)
-    server.listen(port)
-        
-    def handle_signal(sig, frame):
-        io_loop.add_callback(io_loop.stop)
-    
-    import signal
-    for sig in [signal.SIGINT, signal.SIGTERM]:
-        signal.signal(sig, handle_signal)
-
 def connect(host, port, callback):
     stream = tornado.iostream.IOStream(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
 
@@ -120,6 +109,17 @@ def main():
     async_operation = True
     if async_operation:
         io_loop = tornado.ioloop.IOLoop.instance()
+        
+        def start_tcp_server(handle_stream, port):
+            server = make_tcp_server(handle_stream)
+            server.listen(port)
+                
+            def handle_signal(sig, frame):
+                io_loop.add_callback(io_loop.stop)
+            
+            import signal
+            for sig in [signal.SIGINT, signal.SIGTERM]:
+                signal.signal(sig, handle_signal)
 
         tun_strm = tornado.iostream.PipeIOStream(tun)
 
