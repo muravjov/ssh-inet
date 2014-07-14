@@ -6,6 +6,7 @@ import struct
 import socket
 import sys
 import argparse
+import zipfile
 
 #######################
 # from 
@@ -42,54 +43,6 @@ def pyiface_open_tun_interface():
     name = "tun3"
     ifr.ifr_name = ifr.ifr_name.__class__(bytes(name, "ascii"))
     ifr.ifr_flags = IFF_TUN
-
-#######################
-
-def parse_args():
-    self_options, ssh_options = [], sys.argv[1:]
-    try:
-        idx = ssh_options.index("--")
-        self_options, ssh_options = ssh_options[:idx], ssh_options[idx+1:]
-    except ValueError:
-        pass
-
-    parser = argparse.ArgumentParser()
-    
-    parser.add_argument(
-        '-v', '--verbose', default=False,
-        action='store_true',
-    )
-    
-    parser.add_argument(
-        '--remote_port', default=None,
-        type=int, 
-        help='remote client mode',
-    )
-    
-    parser.add_argument(
-        '--remote_python_binary', default=None,
-        help='remote tornado pythonpath',
-    )
-    
-    return parser.parse_args(self_options), ssh_options
-
-args, ssh_options = parse_args()
-is_local = args.remote_port is None
-
-if args.verbose:
-    def log(msg, *msgs):
-        prefix = "local:" if is_local else "remote:"
-        print(prefix, msg, *msgs)
-else:
-    def log(msg, *msgs):
-        pass
-
-if is_local and not ssh_options:
-    log("no server to connect")
-    sys.exit(1)
-
-#import tornado.ioloop
-#import tornado.iostream
 
 #######################
 
@@ -298,9 +251,122 @@ def append_dns_nameserver(ifname):
     nameserver = "8.8.8.8"
     with subprocess.Popen(shlex.split("resolvconf -a %s" % ifname), stdin=subprocess.PIPE) as p:
         p.communicate(input=bytes("nameserver %s" % nameserver, "ascii"))
+
+def setup_zip_py_path(zf):
+    import imp
+    class MemoryZipImporter:
+        def __init__(self, zf):
+            self.zf = zf
+            self.modules = {}
+            
+            for info in zf.infolist():
+                filename = info.filename
+                head, sep, tail = filename.rpartition(".")
+                # поддержка только py-модулей, ради простоты
+                if tail == "py":
+                    head_head, init_sep, tail = head.rpartition("/__init__")
+                    if init_sep and not tail:
+                        # это __init__.py
+                        head = head_head
+                    self.modules[head.replace("/", ".")] = filename
+                    
+            #print(self.modules)
+            
+        def find_module(self, fullname, path=None):
+            return self if fullname in self.modules else None
+        
+        def load_module(self, fullname):
+            try:
+                mpath = self.modules[fullname]
+            except:
+                raise ImportError(fullname)
+            
+            mod = sys.modules.setdefault(fullname, imp.new_module(fullname))
+            mod.__file__ = "MemoryZipImporter:%(mpath)s" % locals()
+            # :TRICKY: для вложенных модулей на модуль родителя нужно проставить
+            # __path__ (придет аргумент path в load_module), иначе не загрузятся
+            mod.__path__ = [mpath]
+            
+            txt = zf.read(mpath)
+            #exec txt in mod.__dict__
+            code = compile(txt, mod.__file__, "exec")
+            exec(code, mod.__dict__)
+
+            return mod
+        
+    z_importer = MemoryZipImporter(zf)
+    sys.meta_path.insert(0, z_importer)
+
+#######################
+
+def parse_args():
+    self_options, ssh_options = [], sys.argv[1:]
+    try:
+        idx = ssh_options.index("--")
+        self_options, ssh_options = ssh_options[:idx], ssh_options[idx+1:]
+    except ValueError:
+        pass
+
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument(
+        '-v', '--verbose', default=False,
+        action='store_true',
+    )
+    
+    parser.add_argument(
+        '--remote_port', default=None,
+        type=int, 
+        help='remote client mode',
+    )
+    
+    parser.add_argument(
+        '--remote_python_binary', default=None,
+        help='remote tornado pythonpath',
+    )
+    
+    return parser.parse_args(self_options), ssh_options
+
+args, ssh_options = parse_args()
+is_local = args.remote_port is None
+
+if args.verbose:
+    def log(msg, *msgs):
+        prefix = "local:" if is_local else "remote:"
+        print(prefix, msg, *msgs)
+else:
+    def log(msg, *msgs):
+        pass
+
+if is_local and not ssh_options:
+    log("no server to connect")
+    sys.exit(1)
+
+#tornado_zip = ""
+
+# загрузка зависимостей
+dep_zf = None
+if "tornado_zip" in dir():
+    import base64
+    tornado_zip = base64.b64decode(bytes(tornado_zip, "ascii"))
+    
+    import io
+    dep_zf = zipfile.ZipFile(io.StringIO(tornado_zip))
+elif is_local:
+    # :TODO: переделать через ключ --tornado_zip <path>
+    local_zip_fname = os.path.join(os.path.dirname(__file__), "tornado322.zip")
+    dep_zf = zipfile.ZipFile(local_zip_fname)
+    
+if dep_zf:
+    setup_zip_py_path(dep_zf)
+
+import tornado.ioloop
+import tornado.iostream
+
+#######################
         
 if __name__ == "__main__":
-    if False:
+    if True:
         main()
         
     if False:
@@ -316,58 +382,12 @@ if __name__ == "__main__":
         ret = call_cmd("ssh bbl-ott-node01-01-77 bash")
         print("!", ret)
         
-    if True:
+    if False:
         zip_path = "/home/ilya/opt/programming/ssh-inet/tornado322.zip"
-        import zipfile
-        import imp
+        
         with zipfile.ZipFile(zip_path) as zf:
+            setup_zip_py_path(zf)
             
-            
-            class MemoryZipImporter:
-                def __init__(self, zf):
-                    self.zf = zf
-                    self.modules = {}
-                    
-                    for info in zf.infolist():
-                        filename = info.filename
-                        head, sep, tail = filename.rpartition(".")
-                        # поддержка только py-модулей, ради простоты
-                        if tail == "py":
-                            head_head, init_sep, tail = head.rpartition("/__init__")
-                            if init_sep and not tail:
-                                # это __init__.py
-                                head = head_head
-                            self.modules[head.replace("/", ".")] = filename
-                            
-                    #print(self.modules)
-                    
-                def find_module(self, fullname, path=None):
-                    return self if fullname in self.modules else None
-                
-                def load_module(self, fullname):
-                    try:
-                        mpath = self.modules[fullname]
-                    except:
-                        raise ImportError(fullname)
-                    
-                    mod = sys.modules.setdefault(fullname, imp.new_module(fullname))
-                    mod.__file__ = "MemoryZipImporter:%(mpath)s" % locals()
-                    # :TRICKY: для вложенных модулей на модуль родителя нужно проставить
-                    # __path__ (придет аргумент path в load_module), иначе не загрузятся
-                    mod.__path__ = [mpath]
-                    
-                    txt = zf.read(mpath)
-                    #exec txt in mod.__dict__
-                    code = compile(txt, mod.__file__, "exec")
-                    exec(code, mod.__dict__)
-
-                    return mod
-    
-            import sys
-                
-            z_importer = MemoryZipImporter(zf)
-            sys.meta_path.insert(0, z_importer)
-    
             import tornado.ioloop
             import tornado
             import tornado.ioloop
