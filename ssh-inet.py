@@ -189,14 +189,17 @@ def main():
             
             # запускаем удаленно скрипт
             python_exec = args.remote_python_binary if args.remote_python_binary else "python3"
+            script = args.remote_si if args.remote_si else "-"
             verbose = " --verbose" if args.verbose else "" 
-            cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s sudo %(python_exec)s -%(verbose)s --remote_port %(port)s --" % locals())
+            cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s sudo %(python_exec)s %(script)s%(verbose)s --remote_port %(port)s --" % locals())
             log(cmd)
             
             import tornado.process as tornado_process
             Subprocess = tornado_process.Subprocess
             
-            if True:
+            if args.remote_si:
+                ssh_proc = Subprocess(cmd)
+            else:
                 ssh_proc = Subprocess(cmd, stdin=subprocess.PIPE)
                 
                 with open(__file__, "rb") as f:
@@ -205,10 +208,6 @@ def main():
                 # => лучше асинхронно сделать
                 ssh_proc.stdin.write(this_text)
                 ssh_proc.stdin.close()
-            else:
-                cmd = ["ssh"] + ssh_options + shlex.split("-- ls -l")
-                log(cmd)
-                ssh_proc = Subprocess(cmd)
         else:
             def on_connection(stream):
                 start_proxying(stream)
@@ -313,6 +312,11 @@ def parse_args():
         '-v', '--verbose', default=False,
         action='store_true',
     )
+
+    parser.add_argument(
+        '--remote_si', default=None,
+        help='remote ssh-inet peer to communicate instead of copying this one',
+    )
     
     parser.add_argument(
         '--remote_port', default=None,
@@ -330,16 +334,13 @@ def parse_args():
 args, ssh_options = parse_args()
 is_local = args.remote_port is None
 
-if args.verbose:
-    def log(msg, *msgs):
+def log(msg, *msgs, is_error=False):
+    if args.verbose or is_error:
         prefix = "local:" if is_local else "remote:"
         print(prefix, msg, *msgs)
-else:
-    def log(msg, *msgs):
-        pass
 
 if is_local and not ssh_options:
-    log("no server to connect")
+    log("no server to connect", is_error=True)
     sys.exit(1)
 
 #tornado_zip = ""
@@ -366,20 +367,20 @@ import tornado.iostream
 #######################
         
 if __name__ == "__main__":
-    if True:
+    if False:
         main()
         
     if False:
-        #call_cmd("ssh bbl-ott-node02-01-77 sudo ls /root")
+        #call_cmd("ssh 192.168.1.2 sudo ls /root")
         #setup_masquerade()
         append_dns_nameserver("tun1")
         
-    if False:
+    if True:
         import sys, os
         #print(os.environ["PS1"], "!")
         #ret = call_cmd("/bin/bash")
         #ret = call_cmd("mysql -u root")
-        ret = call_cmd("ssh bbl-ott-node01-01-77 bash")
+        ret = call_cmd("ssh 192.168.1.2 sudo bash")
         print("!", ret)
         
     if False:
