@@ -184,8 +184,8 @@ def main():
                 os.setresuid(int(os.environ["SUDO_UID"]), -1, -1)
                 # странно, почему-то ssh вылетал с ошибкой "нельзя выполнить setresgid()"
                 # теперь вот перестал
-                #orig_gid = int(os.environ["SUDO_GID"])
-                #os.setresgid(orig_gid, orig_gid, orig_gid)
+                orig_gid = int(os.environ["SUDO_GID"])
+                os.setresgid(orig_gid, orig_gid, orig_gid)
             
             # запускаем удаленно скрипт
             python_exec = args.remote_python_binary if args.remote_python_binary else "python3"
@@ -351,7 +351,7 @@ if "tornado_zip" in dir():
     tornado_zip = base64.b64decode(bytes(tornado_zip, "ascii"))
     
     import io
-    dep_zf = zipfile.ZipFile(io.StringIO(tornado_zip))
+    dep_zf = zipfile.ZipFile(io.BytesIO(tornado_zip))
 elif is_local:
     # :TODO: переделать через ключ --tornado_zip <path>
     local_zip_fname = os.path.join(os.path.dirname(__file__), "tornado322.zip")
