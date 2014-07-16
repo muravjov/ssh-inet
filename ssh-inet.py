@@ -190,7 +190,15 @@ def main():
             # запускаем удаленно скрипт
             python_exec = args.remote_python_binary if args.remote_python_binary else "python3"
             script = args.remote_si if args.remote_si else "-"
-            verbose = " --verbose" if args.verbose else "" 
+            verbose = " --verbose" if args.verbose else ""
+            
+            # чтоб не было "no tty present and no askpass program specified"
+            if not("-t" in ssh_options):
+                if args.remote_si:
+                    ssh_options.append("-t")
+                else:
+                    log("Asuming NOPASSWD for sudo is on.")
+            
             cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s sudo %(python_exec)s %(script)s%(verbose)s --remote_port %(port)s --" % locals())
             log(cmd)
             
@@ -367,7 +375,7 @@ import tornado.iostream
 #######################
         
 if __name__ == "__main__":
-    if False:
+    if True:
         main()
         
     if False:
@@ -375,12 +383,11 @@ if __name__ == "__main__":
         #setup_masquerade()
         append_dns_nameserver("tun1")
         
-    if True:
-        import sys, os
+    if False:
         #print(os.environ["PS1"], "!")
         #ret = call_cmd("/bin/bash")
         #ret = call_cmd("mysql -u root")
-        ret = call_cmd("ssh localhost sudo bash")
+        ret = call_cmd("ssh -t localhost sudo bash")
         print("!", ret)
         
     if False:
