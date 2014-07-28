@@ -85,150 +85,206 @@ def call_cmd(cmd):
 
 def main():
     
-    # чтобы без root'а запускать: sudo setcap cap_net_admin+eip
-    tun, ifname = open_tun_interface()
-
-    local_ip  = "10.0.0.1"
-    remote_ip = "10.0.0.2"
-
-    this_ip = local_ip if is_local else remote_ip
-    that_ip = remote_ip if is_local else local_ip
+    tun = None
+    can_read_tun = True
+    if args.test_speed:
+        # может вылезти "Reached maximum read buffer size" => запись в сокет не поспевает
+        if is_local:
+            fd = sys.stdin.fileno()
+        else:
+            if args.save_dump:
+                dump_fpath = args.save_dump
+                # os.O_CREAT - чтобы создался, если нет
+                # os.O_TRUNC - чтобы обнулился, если есть
+                flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY
+            else:
+                dump_fpath = "/dev/null"
+                flags = os.O_RDWR
+            fd = os.open(dump_fpath, flags) # sys.stderr.fileno() # sys.stdout.fileno()
+            # :TRICKY: /dev/null, stdout/stderr нельзя читать - сразу EOF => выход ssh-inet
+            can_read_tun = False
         
-    call_cmd("ip address add %(this_ip)s/30 peer %(that_ip)s dev %(ifname)s" % locals())
-    call_cmd("ip link set dev %(ifname)s up" % locals())
+        def tell(fd):
+            return os.lseek(fd, 0, os.SEEK_CUR)
+        
+        import errno
+        def is_fd_open(fd):
+            res = True
+            try:
+                tell(fd)
+            except OSError as e:
+                res = e.errno != errno.EBADF
+            
+            return res
+        
+        #os.close(fd)
+        # :TRICKY: при выполнении "python -" интерпретатор не сразу закрывает
+        # stdin, поэтому на is_fd_open(fd) полагаться нельзя
+        if is_fd_open(fd) and (is_local or fd != sys.stdin.fileno()):
+            tun = fd
+        else:
+            assert False, "Can't test speed"
+    else:
+        # чтобы без root'а запускать: sudo setcap cap_net_admin+eip
+        tun, ifname = open_tun_interface()
+    
+        local_ip  = "10.0.0.1"
+        remote_ip = "10.0.0.2"
+    
+        this_ip = local_ip if is_local else remote_ip
+        that_ip = remote_ip if is_local else local_ip
+            
+        call_cmd("ip address add %(this_ip)s/30 peer %(that_ip)s dev %(ifname)s" % locals())
+        call_cmd("ip link set dev %(ifname)s up" % locals())
+    
+        if is_local:
+            # по умолчанию в ядре маршрутизация выключена, см. devinet.c, ipv4_devconf_dflt
+            call_cmd("sysctl -q net.ipv4.ip_forward=1")
+    
+            setup_masquerade()
+        else:
+            call_cmd("ip route add default dev %(ifname)s" % locals())
+            append_dns_nameserver(ifname)
+
+        sync_read = False
+        if sync_read:
+            # почему-то в этом случае только 1-й байт пинга считывается 
+            while True:
+                s = os.read(tun, 1)
+                print("!", s)
+    
+            os.close(tun)
+            sys.exit(0)
+            
+    io_loop = tornado.ioloop.IOLoop.instance()
+    
+    def start_tcp_server(handle_stream, port):
+        server = make_tcp_server(handle_stream)
+        server.listen(port)
+            
+        def handle_signal(sig, frame):
+            io_loop.add_callback(io_loop.stop)
+        
+        import signal
+        for sig in [signal.SIGINT, signal.SIGTERM]:
+            signal.signal(sig, handle_signal)
+
+    tun_strm = None if tun is None else tornado.iostream.PipeIOStream(tun)
+                
+    tun_socket = make_struct(
+        tun = tun_strm,
+        socket = None,
+    )
+    
+    def on_stream_end():
+        log("Stream is closed")
+        io_loop.stop()
+    
+    # 1 тоннель
+    def write_to_socket(bs):
+        if bs:
+            log("tun => socket")
+            
+            strm = tun_socket.socket
+            if strm:
+                strm.write(bs)
+            else:
+                assert False
+                #log("No socket, dropping")
+    
+    def handle_tun_read(bs):
+        write_to_socket(bs)
+    def handle_tun_read_end(bs):
+        write_to_socket(bs)
+        
+        on_stream_end()
+        assert False, "Client tunnel fd is closed"
+        
+    # 2 сокет
+    if tun_strm:
+        def do_write_to_tun(bs):
+            tun_strm.write(bs)
+    else:
+        def do_write_to_tun(bs):
+            pass
+    
+    def write_to_tun(bs):
+        log("socket => tun")
+        
+        if bs:
+            do_write_to_tun(bs)
+            
+    def start_proxying(stream):
+        tun_socket.socket = stream
+        
+        def handle_socket_read(bs):
+            write_to_tun(bs)
+        def handle_socket_read_end(bs):
+            write_to_tun(bs)
+            on_stream_end()
+        stream.read_until_close(handle_socket_read_end, streaming_callback=handle_socket_read)
+        
+        if tun_strm and can_read_tun:
+            tun_strm.read_until_close(handle_tun_read_end, streaming_callback=handle_tun_read)
 
     if is_local:
-        # по умолчанию в ядре маршрутизация выключена, см. devinet.c, ipv4_devconf_dflt
-        call_cmd("sysctl -q net.ipv4.ip_forward=1")
-
-        setup_masquerade()
-    else:
-        call_cmd("ip route add default dev %(ifname)s" % locals())
-        append_dns_nameserver(ifname)
-
-    async_operation = True
-    if async_operation:
-        io_loop = tornado.ioloop.IOLoop.instance()
-        
-        def start_tcp_server(handle_stream, port):
-            server = make_tcp_server(handle_stream)
-            server.listen(port)
-                
-            def handle_signal(sig, frame):
-                io_loop.add_callback(io_loop.stop)
-            
-            import signal
-            for sig in [signal.SIGINT, signal.SIGTERM]:
-                signal.signal(sig, handle_signal)
-
-        tun_strm = tornado.iostream.PipeIOStream(tun)
-
-        tun_socket = make_struct(
-            tun = tun_strm,
-            socket = None,
-        )
-        
-        def on_stream_end():
-            log("Stream is closed")
-            io_loop.stop()
-        
-        # 1 тоннель
-        def write_to_socket(bs):
-            if bs:
-                log("tun => socket")
-                
-                strm = tun_socket.socket
-                if strm:
-                    strm.write(bs)
-                else:
-                    log("No socket, dropping")
-        
-        def handle_tun_read(bs):
-            write_to_socket(bs)
-        def handle_tun_read_end(bs):
-            write_to_socket(bs)
-            
-            on_stream_end()
-            assert False, "Client tunnel fd is closed"
-        tun_strm.read_until_close(handle_tun_read_end, streaming_callback=handle_tun_read)
-        
-        # 2 сокет
-        def write_to_tun(bs):
-            log("socket => tun")
-            
-            if bs:
-                tun_socket.tun.write(bs)
-                
-        def start_proxying(stream):
-            tun_socket.socket = stream
-            
-            def handle_socket_read(bs):
-                write_to_tun(bs)
-            def handle_socket_read_end(bs):
-                write_to_tun(bs)
-                on_stream_end()
-            stream.read_until_close(handle_socket_read_end, streaming_callback=handle_socket_read)
-
-        if is_local:
-            def handle_stream(self, stream, address):
-                if tun_socket.socket is None:
-                    start_proxying(stream)
-                else:
-                    log("Needless connection, dropping")
-                    stream.close()
-            port = 1080
-            start_tcp_server(handle_stream, port)
-            
-            # меняем назад uid, если под sudo, чтобы не смутить ssh
-            if "SUDO_UID" in os.environ:
-                os.setresuid(int(os.environ["SUDO_UID"]), -1, -1)
-                # странно, почему-то ssh вылетал с ошибкой "нельзя выполнить setresgid()"
-                # теперь вот перестал
-                orig_gid = int(os.environ["SUDO_GID"])
-                os.setresgid(orig_gid, orig_gid, orig_gid)
-            
-            # запускаем удаленно скрипт
-            python_exec = args.remote_python_binary if args.remote_python_binary else "python3"
-            script = args.remote_si if args.remote_si else "-"
-            verbose = " --verbose" if args.verbose else ""
-            
-            # чтоб не было "no tty present and no askpass program specified"
-            if not("-t" in ssh_options):
-                if args.remote_si:
-                    ssh_options.append("-t")
-                else:
-                    log("Asuming NOPASSWD for sudo is on.")
-            
-            cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s sudo %(python_exec)s %(script)s%(verbose)s --remote_port %(port)s --" % locals())
-            log(cmd)
-            
-            import tornado.process as tornado_process
-            Subprocess = tornado_process.Subprocess
-            
-            if args.remote_si:
-                ssh_proc = Subprocess(cmd)
-            else:
-                ssh_proc = Subprocess(cmd, stdin=subprocess.PIPE)
-                
-                with open(__file__, "rb") as f:
-                    this_text = f.read()
-                # :TODO: если на той стороне не скачают, то будет затык
-                # => лучше асинхронно сделать
-                ssh_proc.stdin.write(this_text)
-                ssh_proc.stdin.close()
-        else:
-            def on_connection(stream):
+        def handle_stream(self, stream, address):
+            if tun_socket.socket is None:
                 start_proxying(stream)
-            connect("localhost", args.remote_port, on_connection)
+            else:
+                log("Needless connection, dropping")
+                stream.close()
+        port = 1080
+        start_tcp_server(handle_stream, port)
         
-        io_loop.start()
+        # меняем назад uid, если под sudo, чтобы не смутить ssh
+        if "SUDO_UID" in os.environ:
+            os.setresuid(int(os.environ["SUDO_UID"]), -1, -1)
+            # странно, почему-то ssh вылетал с ошибкой "нельзя выполнить setresgid()"
+            # теперь вот перестал
+            orig_gid = int(os.environ["SUDO_GID"])
+            os.setresgid(orig_gid, orig_gid, orig_gid)
+        
+        # запускаем удаленно скрипт
+        # :REFACTOR: добавление параметров убого
+        python_exec = args.remote_python_binary if args.remote_python_binary else "python3"
+        script = args.remote_si if args.remote_si else "-"
+        verbose = " --verbose" if args.verbose else ""
+        
+        test_speed = " --test_speed" if args.test_speed else ""
+        sudo = "" if args.test_speed else "sudo "
+        save_dump = " --save_dump '%s'" % args.save_dump if args.save_dump else ""
+        
+        # чтоб не было "no tty present and no askpass program specified"
+        if not("-t" in ssh_options):
+            if args.remote_si:
+                ssh_options.append("-t")
+            else:
+                log("Asuming NOPASSWD for sudo is on.")
+        
+        cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s %(sudo)s%(python_exec)s %(script)s%(verbose)s%(test_speed)s%(save_dump)s --remote_port %(port)s --" % locals())
+        log(cmd)
+        
+        import tornado.process as tornado_process
+        Subprocess = tornado_process.Subprocess
+        
+        if args.remote_si:
+            ssh_proc = Subprocess(cmd)
+        else:
+            ssh_proc = Subprocess(cmd, stdin=subprocess.PIPE)
+            
+            with open(__file__, "rb") as f:
+                this_text = f.read()
+            # :TODO: если на той стороне не скачают, то будет затык
+            # => лучше асинхронно сделать
+            ssh_proc.stdin.write(this_text)
+            ssh_proc.stdin.close()
     else:
-        # почему-то в этом случае только 1-й байт пинга считывается 
-        while True:
-            s = os.read(tun, 1)
-            print("!", s)
-
-        os.close(tun)
+        def on_connection(stream):
+            start_proxying(stream)
+        connect("localhost", args.remote_port, on_connection)
+    
+    io_loop.start()
 
 def setup_masquerade():
     subnet = "10.0.0.0/30"
@@ -336,7 +392,22 @@ def parse_args():
         '--remote_python_binary', default=None,
         help='remote tornado pythonpath',
     )
-    
+
+    parser.add_argument(
+        '--tornado_zip', default=None,
+        help='path to zip archive with dependencies (Tornado)',
+    )
+
+    parser.add_argument(
+        '--test_speed', default=False,
+        action='store_true',
+    )
+
+    parser.add_argument(
+        '--save_dump', default=None,
+        help='save transferred bits for --test_speed mode',
+    )
+
     return parser.parse_args(self_options), ssh_options
 
 args, ssh_options = parse_args()
@@ -345,7 +416,7 @@ is_local = args.remote_port is None
 def log(msg, *msgs, is_error=False):
     if args.verbose or is_error:
         prefix = "local:" if is_local else "remote:"
-        print(prefix, msg, *msgs)
+        print(prefix, msg, *msgs, file=sys.stderr)
 
 if is_local and not ssh_options:
     log("no server to connect", is_error=True)
@@ -360,14 +431,14 @@ if "tornado_zip" in dir():
     tornado_zip = base64.b64decode(bytes(tornado_zip, "ascii"))
     
     import io
-    dep_zf = zipfile.ZipFile(io.BytesIO(tornado_zip))
+    dep_zf = io.BytesIO(tornado_zip)
+elif args.tornado_zip:
+    dep_zf = args.tornado_zip
 elif is_local:
-    # :TODO: переделать через ключ --tornado_zip <path>
-    local_zip_fname = os.path.join(os.path.dirname(__file__), "tornado322.zip")
-    dep_zf = zipfile.ZipFile(local_zip_fname)
+    dep_zf = os.path.join(os.path.dirname(__file__), "tornado322.zip")
     
 if dep_zf:
-    setup_zip_py_path(dep_zf)
+    setup_zip_py_path(zipfile.ZipFile(dep_zf))
 
 import tornado.ioloop
 import tornado.iostream
