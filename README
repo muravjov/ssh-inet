@@ -1,0 +1,26 @@
+ ssh-inet
+ 
+ Use it like ssh command:
+- ssh-inet my-server-without-internet
+- ssh-inet user@my-server-without-internet
+ 
+ Specific ssh-inet options are delimited with --:
+- ssh-inet -v -- my-server-without-internet
+- ssh-inet --help --
+
+ TODO:
+- 100x speed degradation vs 10x degradation over raw ssh -wN:N :( ;
+  I don't know why the speed is so low because transmitting bits in test mode,
+  --test_speed, the speed is even better vs -wN:N mode; one may test like so:
+    cat /dev/urandom | pv | ssh-inet --test_speed -- 172.16.247.130
+  ; details:
+  - changing MTU and qlen is not working
+  - it is better to measure speed (see 'pv') at the remote side
+- the script requires "resolvconf" to exist on the remote side or it breaks;
+  (it is used to add 8.8.8.8 nameserver)
+- by default ssh-net copies yourself to the remote side and run as follows:
+  ssh python3 - --remote_port 1080 --
+  ; in such case the errors from remote side is not printed because it seems
+  Python closes stdout/stderr after a shot time, too (not only stdin).
+- the default route (to the internet) will be set up if there is no a default route
+  there at the remote server

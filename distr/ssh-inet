@@ -85,9 +85,45 @@ def call_cmd(cmd):
 
 def main():
     
+    tun = None
+    can_read_tun = True
     if args.test_speed:
         # может вылезти "Reached maximum read buffer size" => запись в сокет не поспевает
-        tun = sys.stdin.fileno()
+        if is_local:
+            fd = sys.stdin.fileno()
+        else:
+            if args.save_dump:
+                dump_fpath = args.save_dump
+                # os.O_CREAT - чтобы создался, если нет
+                # os.O_TRUNC - чтобы обнулился, если есть
+                flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY
+            else:
+                dump_fpath = "/dev/null"
+                flags = os.O_RDWR
+            fd = os.open(dump_fpath, flags) # sys.stderr.fileno() # sys.stdout.fileno()
+            # :TRICKY: /dev/null, stdout/stderr нельзя читать - сразу EOF => выход ssh-inet
+            can_read_tun = False
+        
+        def tell(fd):
+            return os.lseek(fd, 0, os.SEEK_CUR)
+        
+        import errno
+        def is_fd_open(fd):
+            res = True
+            try:
+                tell(fd)
+            except OSError as e:
+                res = e.errno != errno.EBADF
+            
+            return res
+        
+        #os.close(fd)
+        # :TRICKY: при выполнении "python -" интерпретатор не сразу закрывает
+        # stdin, поэтому на is_fd_open(fd) полагаться нельзя
+        if is_fd_open(fd) and (is_local or fd != sys.stdin.fileno()):
+            tun = fd
+        else:
+            assert False, "Can't test speed"
     else:
         # чтобы без root'а запускать: sudo setcap cap_net_admin+eip
         tun, ifname = open_tun_interface()
@@ -120,8 +156,6 @@ def main():
             os.close(tun)
             sys.exit(0)
             
-    tun_strm = tornado.iostream.PipeIOStream(tun)
-        
     io_loop = tornado.ioloop.IOLoop.instance()
     
     def start_tcp_server(handle_stream, port):
@@ -135,6 +169,8 @@ def main():
         for sig in [signal.SIGINT, signal.SIGTERM]:
             signal.signal(sig, handle_signal)
 
+    tun_strm = None if tun is None else tornado.iostream.PipeIOStream(tun)
+                
     tun_socket = make_struct(
         tun = tun_strm,
         socket = None,
@@ -153,7 +189,8 @@ def main():
             if strm:
                 strm.write(bs)
             else:
-                log("No socket, dropping")
+                assert False
+                #log("No socket, dropping")
     
     def handle_tun_read(bs):
         write_to_socket(bs)
@@ -163,15 +200,13 @@ def main():
         on_stream_end()
         assert False, "Client tunnel fd is closed"
         
-    tun_strm.read_until_close(handle_tun_read_end, streaming_callback=handle_tun_read)
-     
     # 2 сокет
-    if args.test_speed:
-        def do_write_to_tun(bs):
-            pass
-    else:
+    if tun_strm:
         def do_write_to_tun(bs):
             tun_strm.write(bs)
+    else:
+        def do_write_to_tun(bs):
+            pass
     
     def write_to_tun(bs):
         log("socket => tun")
@@ -188,6 +223,9 @@ def main():
             write_to_tun(bs)
             on_stream_end()
         stream.read_until_close(handle_socket_read_end, streaming_callback=handle_socket_read)
+        
+        if tun_strm and can_read_tun:
+            tun_strm.read_until_close(handle_tun_read_end, streaming_callback=handle_tun_read)
 
     if is_local:
         def handle_stream(self, stream, address):
@@ -208,10 +246,14 @@ def main():
             os.setresgid(orig_gid, orig_gid, orig_gid)
         
         # запускаем удаленно скрипт
+        # :REFACTOR: добавление параметров убого
         python_exec = args.remote_python_binary if args.remote_python_binary else "python3"
         script = args.remote_si if args.remote_si else "-"
         verbose = " --verbose" if args.verbose else ""
+        
         test_speed = " --test_speed" if args.test_speed else ""
+        sudo = "" if args.test_speed else "sudo "
+        save_dump = " --save_dump '%s'" % args.save_dump if args.save_dump else ""
         
         # чтоб не было "no tty present and no askpass program specified"
         if not("-t" in ssh_options):
@@ -220,7 +262,7 @@ def main():
             else:
                 log("Asuming NOPASSWD for sudo is on.")
         
-        cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s sudo %(python_exec)s %(script)s%(verbose)s%(test_speed)s --remote_port %(port)s --" % locals())
+        cmd = ["ssh"] + ssh_options + shlex.split("-R %(port)s:localhost:%(port)s %(sudo)s%(python_exec)s %(script)s%(verbose)s%(test_speed)s%(save_dump)s --remote_port %(port)s --" % locals())
         log(cmd)
         
         import tornado.process as tornado_process
@@ -352,15 +394,20 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--tornado_zip', default=None,
+        help='path to zip archive with dependencies (Tornado)',
+    )
+
+    parser.add_argument(
         '--test_speed', default=False,
         action='store_true',
     )
 
     parser.add_argument(
-        '--tornado_zip', default=None,
-        help='path to zip archive with dependencies (Tornado)',
+        '--save_dump', default=None,
+        help='save transferred bits for --test_speed mode',
     )
-    
+
     return parser.parse_args(self_options), ssh_options
 
 args, ssh_options = parse_args()
@@ -369,7 +416,7 @@ is_local = args.remote_port is None
 def log(msg, *msgs, is_error=False):
     if args.verbose or is_error:
         prefix = "local:" if is_local else "remote:"
-        print(prefix, msg, *msgs)
+        print(prefix, msg, *msgs, file=sys.stderr)
 
 if is_local and not ssh_options:
     log("no server to connect", is_error=True)
@@ -387,8 +434,10 @@ if "tornado_zip" in dir():
     dep_zf = io.BytesIO(tornado_zip)
 elif args.tornado_zip:
     dep_zf = args.tornado_zip
-elif is_local:
-    dep_zf = os.path.join(os.path.dirname(__file__), "tornado322.zip")
+else:
+    _dep_zf = os.path.join(os.path.dirname(__file__), "tornado322.zip")
+    if os.path.exists(_dep_zf):
+        dep_zf = _dep_zf
     
 if dep_zf:
     setup_zip_py_path(zipfile.ZipFile(dep_zf))

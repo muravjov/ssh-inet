@@ -434,8 +434,10 @@ if "tornado_zip" in dir():
     dep_zf = io.BytesIO(tornado_zip)
 elif args.tornado_zip:
     dep_zf = args.tornado_zip
-elif is_local:
-    dep_zf = os.path.join(os.path.dirname(__file__), "tornado322.zip")
+else:
+    _dep_zf = os.path.join(os.path.dirname(__file__), "tornado322.zip")
+    if os.path.exists(_dep_zf):
+        dep_zf = _dep_zf
     
 if dep_zf:
     setup_zip_py_path(zipfile.ZipFile(dep_zf))
